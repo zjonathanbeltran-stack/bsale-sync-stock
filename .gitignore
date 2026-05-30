@@ -1,0 +1,13 @@
+# Logs generados por el script
+files/
+*.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# OS
+.DS_Store
+Thumbs.db
