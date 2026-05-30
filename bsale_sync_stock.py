@@ -153,31 +153,24 @@ async def download_offices_parallel(all_ids, offices):
 
 # ── Envío de resumen por email ─────────────────────────────────
 def send_summary_email(subject, body_html, body_text):
-    """Envía email de resumen vía Gmail SMTP"""
-    import smtplib
-    from email.mime.multipart import MIMEMultipart
-    from email.mime.text import MIMEText
-
-    gmail_user = os.environ.get("GMAIL_USER", "zjonathanbeltran@gmail.com")
-    gmail_pass = os.environ.get("GMAIL_APP_PASSWORD", "")
+    """Envía email de resumen vía Resend API"""
+    resend_key = os.environ.get("RESEND_API_KEY", "")
     to_addr    = os.environ.get("NOTIFY_EMAIL", "zjonathanbeltran@gmail.com")
 
-    if not gmail_pass:
-        print("  ⚠ GMAIL_APP_PASSWORD no configurado. Email no enviado.")
-        print("    → Guárdalo en Settings → Secrets como GMAIL_APP_PASSWORD")
+    if not resend_key:
+        print("  ⚠ RESEND_API_KEY no configurado. Email no enviado.")
         return False
 
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"]    = f"Agente Bsale <{gmail_user}>"
-    msg["To"]      = to_addr
-    msg.attach(MIMEText(body_text, "plain", "utf-8"))
-    msg.attach(MIMEText(body_html, "html",  "utf-8"))
-
     try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as server:
-            server.login(gmail_user, gmail_pass)
-            server.sendmail(gmail_user, to_addr, msg.as_string())
+        r = requests.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {resend_key}", "Content-Type": "application/json"},
+            json={"from": "Agente Bsale <onboarding@resend.dev>",
+                  "to": [to_addr], "subject": subject,
+                  "html": body_html, "text": body_text},
+            timeout=30
+        )
+        r.raise_for_status()
         print(f"  ✅ Email enviado a {to_addr}")
         return True
     except Exception as e:
