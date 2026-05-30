@@ -21,6 +21,8 @@ DRY_RUN               = os.environ.get("dry_run", "false").lower() == "true"
 SYNC_ALL              = os.environ.get("sync_all", "false").lower() == "true"
 PRODUCT_LIST_RAW      = os.environ.get("product_list", "")
 PRODUCTS              = [p.strip() for p in PRODUCT_LIST_RAW.split("\n") if p.strip()]
+EXCLUDED_OFFICES_RAW  = os.environ.get("excluded_offices", "").strip().lower()
+EXCLUDED_OFFICES      = [e.strip() for e in EXCLUDED_OFFICES_RAW.split(",") if e.strip()]
 
 # Parámetros de rate limiting
 POST_BATCH_SIZE       = 30     # Aplicar pausa cada N POSTs
@@ -204,10 +206,17 @@ def main():
         print(f"❌ No encontré bodega con '{DISTRIBUIDORA_KEYWORD}'.")
         print(f"   Disponibles: {', '.join(offices.keys())}"); return
     dist_id    = int(dist["id"])
-    source_ids = [int(o["id"]) for n,o in offices.items() if int(o["id"]) != dist_id]
+    source_ids = [
+        int(o["id"]) for n,o in offices.items()
+        if int(o["id"]) != dist_id
+        and not any(excl in n for excl in EXCLUDED_OFFICES)
+    ]
+    excluded_names = [n for n,o in offices.items() if any(excl in n for excl in EXCLUDED_OFFICES)]
     print(f"✅ Distribuidora: '{dist['name']}' (ID {dist_id})")
+    if excluded_names:
+        print(f"🚫 Bodegas excluidas: {', '.join(excluded_names)}")
     print(f"📂 Bodegas fuente ({len(source_ids)}): "
-          f"{', '.join(n for n,o in offices.items() if int(o['id'])!=dist_id)}")
+          f"{', '.join(n for n,o in offices.items() if int(o['id'])!=dist_id and not any(excl in n for excl in EXCLUDED_OFFICES))}")
 
     # ── 2. Stocks en paralelo ────────────────────────────────
     print(f"\n⚡ Descargando stock de {len(source_ids)+1} bodegas EN PARALELO...")
