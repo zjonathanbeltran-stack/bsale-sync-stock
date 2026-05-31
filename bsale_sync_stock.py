@@ -254,7 +254,7 @@ def main():
     print(f"\n⚙️  Calculando y aplicando cambios...")
     entradas = salidas = sin_cambio = errores_count = 0
     post_count = 0
-    cambios = []; errores = []
+    cambios = []; errores = []; stock_cero = []
 
     for i, vid in enumerate(target_ids, 1):
         try:
@@ -264,11 +264,16 @@ def main():
             nombre    = variants_info.get(vid, f"Variante ID {vid}")
 
             if abs(diff) < 0.01:
-                sin_cambio += 1; continue
+                sin_cambio += 1
+                if max_stock == 0:
+                    stock_cero.append({"variante": nombre, "id": vid})
+                continue
 
             accion = "ENTRADA" if diff > 0 else "SALIDA"
             cambios.append({"variante": nombre, "id": vid, "accion": accion,
                             "antes": current, "despues": max_stock, "diff": abs(diff)})
+            if max_stock == 0:
+                stock_cero.append({"variante": nombre, "id": vid})
 
             if not DRY_RUN:
                 note = f"Sync {datetime.now().strftime('%d/%m/%Y')} — {nombre[:45]}"
@@ -338,13 +343,22 @@ def main():
     print(f"   ❌ Errores              : {errores_count}")
 
     if precio_cero:
-        print(f"\n⚠️  {len(precio_cero)} producto(s) con STOCK en Distribuidora pero PRECIO $0 en '{pl['name']}':")
+        print(f"\n⚠️  {len(precio_cero)} producto(s) con STOCK en Distribuidora pero PRECIO $0 en '{pl['name'] if pl else PRICE_LIST_NAME}':")
         for p in precio_cero[:30]:
             print(f"   • {p['nombre']}  (stock: {p['stock_dist']:.0f})")
         if len(precio_cero) > 30:
             print(f"   ... y {len(precio_cero)-30} más (ver log)")
     else:
         print(f"\n✅ Sin productos con precio $0 en Distribuidora.")
+
+    if stock_cero:
+        print(f"\n🔴 {len(stock_cero)} producto(s) quedaron en STOCK 0 (sin stock en ninguna bodega física):")
+        for p in stock_cero[:50]:
+            print(f"   • {p['variante']}")
+        if len(stock_cero) > 50:
+            print(f"   ... y {len(stock_cero)-50} más (ver log)")
+    else:
+        print(f"\n✅ Ningún producto quedó en stock 0.")
 
     if errores:
         print(f"\n❌ Primeros errores:")
@@ -401,6 +415,32 @@ def main():
         cero_section_html = "<p style='color:#38a169;margin-top:16px'>✅ Sin productos con precio $0 activos en Distribuidora.</p>"
         cero_section_text = "\n✅ Sin productos con precio $0 en Distribuidora."
 
+    # Construir sección de stock 0
+    if stock_cero:
+        cero0_rows_html = "".join(
+            f"<tr><td style='padding:5px 12px;border-bottom:1px solid #f0f0f0;font-size:13px'>{p['variante']}</td></tr>"
+            for p in stock_cero[:100]
+        )
+        if len(stock_cero) > 100:
+            cero0_rows_html += f"<tr><td style='padding:5px 12px;color:#888;font-size:12px'>... y {len(stock_cero)-100} más</td></tr>"
+        stock_cero_section_html = f"""
+        <div style="margin-top:24px">
+          <h3 style="color:#c05621;margin-bottom:8px">🔴 {len(stock_cero)} producto(s) quedaron en STOCK 0</h3>
+          <p style="color:#666;font-size:13px">Estos productos no tienen stock en ninguna bodega física y fueron apagados en la Distribuidora.</p>
+          <table style="width:100%;border-collapse:collapse;font-size:13px">
+            <thead><tr style="background:#fff5f0">
+              <th style="padding:8px 12px;text-align:left;color:#c05621">Producto / Variante</th>
+            </tr></thead>
+            <tbody>{cero0_rows_html}</tbody>
+          </table>
+        </div>"""
+        stock_cero_section_text = f"\n🔴 {len(stock_cero)} PRODUCTOS EN STOCK 0:\n" + "\n".join(
+            f"  • {p['variante']}" for p in stock_cero[:100]
+        )
+    else:
+        stock_cero_section_html = "<p style='color:#38a169;margin-top:16px'>✅ Ningún producto quedó en stock 0.</p>"
+        stock_cero_section_text = "\n✅ Ningún producto quedó en stock 0."
+
     body_html = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"></head>
 <body style="font-family:Arial,sans-serif;background:#f7f7f7;padding:20px">
@@ -437,6 +477,7 @@ def main():
         </tr>
       </table>
       {cero_section_html}
+      {stock_cero_section_html}
     </div>
     <div style="background:#f7fafc;padding:14px 32px;font-size:12px;color:#a0aec0;text-align:center">
       Agente Sincronizador de Stock Bsale · CREAO · Ejecución automática 21:00 hrs
@@ -454,8 +495,9 @@ Sin cambio           : {sin_cambio}
 Errores              : {errores_count}
 Tiempo total         : {elapsed/60:.1f} min
 {cero_section_text}
+{stock_cero_section_text}
 """
-    subject = f"{icono} Stock Bsale {fecha_str} — {entradas}↑ {salidas}↓ {len(precio_cero) if precio_cero else 0}⚠️$0"
+    subject = f"{icono} Stock Bsale {fecha_str} — {entradas}↑ {salidas}↓ {len(stock_cero)}🔴cero"
     send_summary_email(subject, body_html, body_text)
 
 
