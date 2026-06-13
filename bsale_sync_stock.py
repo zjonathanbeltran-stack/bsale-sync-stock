@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
-Sincronizador Stock Bsale v5
+Sincronizador Stock Bsale v7
 - Descarga paralela por bodega (aiohttp)
 - Reintentos automáticos en 401/429/503 con backoff exponencial
 - Pausas inteligentes entre bloques de POST para evitar rate limit
 - Nombres completos de productos (expand=product)
+- v6: recepciones con costo real (campo `cost`)
+- v7: precios $0 corregidos desde CASA MATRIZ (token separado),
+  cruce por código de barras, descuento configurable (default 5%)
 """
 import os, json, asyncio, aiohttp, time, math
 from datetime import datetime
@@ -12,17 +15,25 @@ from collections import defaultdict
 import requests
 
 # ── Configuración ──────────────────────────────────────────────
-API_TOKEN             = os.environ.get("BSALE_API_TOKEN", "")
+API_TOKEN             = os.environ.get("BSALE_API_TOKEN", "")       # token Distribuidora
+CM_TOKEN              = os.environ.get("BSALE_CM_TOKEN", "")        # token Casa Matriz (fuente de precios)
 BASE_URL              = "https://api.bsale.cl/v1"
 HEADERS               = {"access_token": API_TOKEN, "Content-Type": "application/json"}
+HEADERS_CM            = {"access_token": CM_TOKEN,  "Content-Type": "application/json"}
 DISTRIBUIDORA_KEYWORD = os.environ.get("distribuidora_name", "distribuidora").strip().lower()
 PRICE_LIST_NAME       = os.environ.get("price_list_name", "DISTRIBUIDORA PRECIOS").strip().lower()
+CM_PRICE_LIST_NAME    = os.environ.get("cm_price_list_name", "SALA DE VENTAS PRECIOS").strip().lower()
+PRICE_DISCOUNT_PCT    = float(os.environ.get("price_discount_pct", "5"))  # % descuento sobre CM
+PRICE_FACTOR          = 1 - PRICE_DISCOUNT_PCT / 100.0
 DRY_RUN               = os.environ.get("dry_run", "false").lower() == "true"
 SYNC_ALL              = os.environ.get("sync_all", "false").lower() == "true"
 PRODUCT_LIST_RAW      = os.environ.get("product_list", "")
 PRODUCTS              = [p.strip() for p in PRODUCT_LIST_RAW.split("\n") if p.strip()]
 EXCLUDED_OFFICES_RAW  = os.environ.get("excluded_offices", "").strip().lower()
 EXCLUDED_OFFICES      = [e.strip() for e in EXCLUDED_OFFICES_RAW.split(",") if e.strip()]
+# v6/v7: sincronización de valores
+SYNC_COSTS            = os.environ.get("sync_costs", "true").lower() == "true"
+SYNC_PRICES           = os.environ.get("sync_prices", "true").lower() == "true"
 
 # Parámetros de rate limiting
 POST_BATCH_SIZE       = 30     # Aplicar pausa cada N POSTs
@@ -83,6 +94,97 @@ def api_post(endpoint, payload):
             if attempt == MAX_RETRIES - 1: raise
             time.sleep(5 * (attempt + 1))
     return {}
+
+def api_get_cm(endpoint, params=None):
+    """GET contra la empresa Casa Matriz (token separado)."""
+    params = {**(params or {})}
+    for attempt in range(MAX_RETRIES):
+        try:
+            r = requests.get(f"{BASE_URL}{endpoint}", headers=HEADERS_CM,
+                             params=params, timeout=45)
+            if r.status_code == 429:
+                wait = min(60, 5 * 2**attempt)
+                print(f"  ⏳ CM Rate limit (429), esperando {wait}s...", flush=True)
+                time.sleep(wait); continue
+            if r.status_code in (401, 500, 503):
+                time.sleep(5 * (attempt + 1)); continue
+            r.raise_for_status()
+            return r.json()
+        except requests.exceptions.Timeout:
+            time.sleep(10 * (attempt + 1))
+        except Exception:
+            if attempt == MAX_RETRIES - 1: raise
+            time.sleep(5 * (attempt + 1))
+    return {}
+
+def load_cm_prices():
+    """Descarga SALA DE VENTAS PRECIOS de Casa Matriz y retorna
+    dict {barcode -> precio_neto} para cruzar con Distribuidora."""
+    if not CM_TOKEN:
+        print("  ⚠ BSALE_CM_TOKEN no configurado — no se corregirán precios desde Casa Matriz.")
+        return {}
+    pls = api_get_cm("/price_lists.json", {"limit": 50}).get("items", [])
+    pl  = next((p for p in pls if CM_PRICE_LIST_NAME in p.get("name", "").lower()), None)
+    if not pl:
+        print(f"  ⚠ Lista '{CM_PRICE_LIST_NAME}' no encontrada en Casa Matriz.")
+        return {}
+    print(f"  📋 Cargando precios de '{pl['name']}' (Casa Matriz)...", flush=True)
+    params = {"limit": 50, "offset": 0, "expand": "[variant]"}
+    cm_prices = {}
+    while True:
+        data  = api_get_cm(f"/price_lists/{pl['id']}/details.json", dict(params))
+        batch = data.get("items", [])
+        for d in batch:
+            v  = d.get("variant") or {}
+            bc = (v.get("barCode") or "").strip()
+            val = float(d.get("variantValue", 0) or 0)
+            if bc and val > 0:
+                cm_prices[bc] = val
+        params["offset"] += len(batch)
+        if not batch or params["offset"] >= data.get("count", 0):
+            break
+        time.sleep(GET_PAGE_SLEEP)
+    print(f"  ✅ {len(cm_prices)} precios cargados desde Casa Matriz")
+    return cm_prices
+
+def api_put(endpoint, payload):
+    for attempt in range(MAX_RETRIES):
+        try:
+            r = requests.put(f"{BASE_URL}{endpoint}", headers=HEADERS,
+                             json=payload, timeout=30)
+            if r.status_code == 429:
+                wait = min(60, 10 * 2**attempt)
+                print(f"  ⏳ Rate limit PUT (429), esperando {wait}s...", flush=True)
+                time.sleep(wait); continue
+            if r.status_code == 401:
+                wait = 5 * (attempt + 1)
+                print(f"  🔑 Token refresh PUT (401), reintento en {wait}s...", flush=True)
+                time.sleep(wait); continue
+            if r.status_code in (500, 503):
+                time.sleep(10 * (attempt + 1)); continue
+            r.raise_for_status()
+            return r.json()
+        except requests.exceptions.Timeout:
+            time.sleep(10 * (attempt + 1))
+        except Exception as e:
+            if attempt == MAX_RETRIES - 1: raise
+            time.sleep(5 * (attempt + 1))
+    return {}
+
+def get_variant_cost(vid):
+    """Costo real de una variante para usar en recepciones.
+    Prefiere la última recepción con costo > 0: el averageCost global
+    queda diluido por el stock virtual de la Distribuidora a costo $0."""
+    data = api_get(f"/variants/{vid}/costs.json")
+    best_cost, best_date = 0.0, -1
+    for h in (data.get("history") or []):
+        c = float(h.get("cost", 0) or 0)
+        d = int(h.get("admissionDate", 0) or 0)
+        if c > 0 and d >= best_date:
+            best_cost, best_date = c, d
+    if best_cost > 0:
+        return best_cost
+    return float(data.get("averageCost", 0) or 0)
 
 def fetch_all_pages(endpoint, params=None, label=""):
     params = {**(params or {}), "limit": 50, "offset": 0}
@@ -253,8 +355,9 @@ def main():
     # ── 4. Calcular diferencias y aplicar cambios ────────────
     print(f"\n⚙️  Calculando y aplicando cambios...")
     entradas = salidas = sin_cambio = errores_count = 0
-    post_count = 0
-    cambios = []; errores = []; stock_cero = []
+    post_count = costos_aplicados = ya_en_cero = 0
+    cambios = []; errores = []; stock_cero = []; sin_costo = []
+    cost_cache = {}
 
     for i, vid in enumerate(target_ids, 1):
         try:
@@ -265,8 +368,9 @@ def main():
 
             if abs(diff) < 0.01:
                 sin_cambio += 1
-                if max_stock == 0:
-                    stock_cero.append({"variante": nombre, "id": vid})
+                # Ya estaba en 0 de ejecuciones anteriores: solo contar, no listar
+                if max_stock == 0 and current == 0:
+                    ya_en_cero += 1
                 continue
 
             accion = "ENTRADA" if diff > 0 else "SALIDA"
@@ -278,11 +382,20 @@ def main():
             if not DRY_RUN:
                 note = f"Sync {datetime.now().strftime('%d/%m/%Y')} — {nombre[:45]}"
                 if diff > 0:
+                    cost = 0.0
+                    if SYNC_COSTS:
+                        if vid not in cost_cache:
+                            cost_cache[vid] = get_variant_cost(vid)
+                        cost = cost_cache[vid]
+                        if cost > 0:
+                            costos_aplicados += 1
+                        else:
+                            sin_costo.append({"variante": nombre, "id": vid})
                     api_post("/stocks/receptions.json", {
                         "admissionDate": int(time.time()),
                         "document": "Ingreso por API", "note": note,
                         "officeId": dist_id,
-                        "details": [{"quantity": diff, "variantId": vid, "unitCost": 0}]
+                        "details": [{"quantity": diff, "variantId": vid, "cost": cost}]
                     })
                     entradas += 1
                 else:
@@ -309,26 +422,66 @@ def main():
             errores_count += 1
             errores.append({"variante": variants_info.get(vid, str(vid)), "error": str(e)})
 
-    # ── 5. Verificar precios $0 ──────────────────────────────
+    # ── 5. Verificar y corregir precios $0 (v7: fuente = Casa Matriz) ──
     print(f"\n💰 Verificando precios $0 en lista '{PRICE_LIST_NAME}'...")
     pls = api_get("/price_lists.json", {"limit": 50}).get("items", [])
     pl  = next((p for p in pls if PRICE_LIST_NAME in p.get("name","").lower()), None)
-    precio_cero = []
+    precio_cero = []; precio_corregido = []
     if pl:
         pl_details = fetch_all_pages(f"/price_lists/{pl['id']}/details.json",
-                                     {"expand": "variant"}, label="Precios")
+                                     {"expand": "[variant]"}, label="Precios")
+
+        # Cargar precios de Casa Matriz (barcode -> neto) una sola vez
+        cm_prices = load_cm_prices() if SYNC_PRICES else {}
+
+        # Construir mapa barcode -> detail_id para la lista Distribuidora
         for d in pl_details:
-            if float(d.get("variantValue", 1)) != 0: continue
+            if float(d.get("variantValue", 1) or 0) != 0: continue
             v = d.get("variant")
             if not isinstance(v, dict): continue
             vid = int(v.get("id", 0))
             if not vid: continue
+            bc = (v.get("barCode") or "").strip()
             if stock_map[vid].get(dist_id, 0) > 0:
                 precio_cero.append({
-                    "id": vid,
+                    "id": vid, "detail_id": d.get("id"),
+                    "barcode": bc,
                     "nombre": variants_info.get(vid, f"ID {vid}"),
                     "stock_dist": stock_map[vid].get(dist_id, 0)
                 })
+
+        # Corregir usando precio CM * factor (descuento)
+        if precio_cero and SYNC_PRICES and cm_prices:
+            pendientes = []
+            put_count = 0
+            for item in precio_cero:
+                bc = item.get("barcode", "")
+                cm_val = cm_prices.get(bc, 0)
+                target = round(cm_val * PRICE_FACTOR) if cm_val > 0 else 0
+                if target <= 0 or not item.get("detail_id"):
+                    pendientes.append(item); continue
+                if DRY_RUN:
+                    precio_corregido.append({**item, "precio": target}); continue
+                try:
+                    # BSale exige el campo id dentro del body, no solo en la URL
+                    api_put(f"/price_lists/{pl['id']}/details/{item['detail_id']}.json",
+                            {"id": item['detail_id'], "variantValue": target})
+                    precio_corregido.append({**item, "precio": target})
+                    put_count += 1
+                    if put_count % POST_BATCH_SIZE == 0:
+                        print(f"  ⏸  Pausa {POST_BATCH_SLEEP}s tras {put_count} precios...", flush=True)
+                        time.sleep(POST_BATCH_SLEEP)
+                except Exception as e:
+                    errores_count += 1
+                    errores.append({"variante": item["nombre"], "error": f"precio: {e}"})
+                    pendientes.append(item)
+            precio_cero = pendientes
+            if precio_corregido:
+                print(f"  ✅ {len(precio_corregido)} precio(s) "
+                      f"{'simulado(s)' if DRY_RUN else 'corregido(s)'} "
+                      f"(CM -{PRICE_DISCOUNT_PCT:.0f}%)")
+        elif precio_cero and SYNC_PRICES and not cm_prices:
+            print("  ⚠ Sin precios de Casa Matriz — configura BSALE_CM_TOKEN y cm_price_list_name.")
     else:
         print(f"  ⚠ Lista '{PRICE_LIST_NAME}' no encontrada.")
 
@@ -340,7 +493,23 @@ def main():
     print(f"   ✅ Entradas (subida)    : {entradas}")
     print(f"   🔻 Salidas  (bajada)    : {salidas}")
     print(f"   ➡️  Sin cambio           : {sin_cambio}")
+    print(f"   💲 Costos aplicados     : {costos_aplicados}")
+    print(f"   💰 Precios corregidos   : {len(precio_corregido)}")
     print(f"   ❌ Errores              : {errores_count}")
+
+    if sin_costo:
+        print(f"\n⚠️  {len(sin_costo)} entrada(s) sin costo conocido (quedaron a $0):")
+        for p in sin_costo[:20]:
+            print(f"   • {p['variante']}")
+        if len(sin_costo) > 20:
+            print(f"   ... y {len(sin_costo)-20} más (ver log)")
+
+    if precio_corregido:
+        print(f"\n💰 {len(precio_corregido)} precio(s) {'a corregir (dry run)' if DRY_RUN else 'corregido(s)'}:")
+        for p in precio_corregido[:30]:
+            print(f"   • {p['nombre']}  → ${p['precio']:,.0f} (neto)")
+        if len(precio_corregido) > 30:
+            print(f"   ... y {len(precio_corregido)-30} más (ver log)")
 
     if precio_cero:
         print(f"\n⚠️  {len(precio_cero)} producto(s) con STOCK en Distribuidora pero PRECIO $0 en '{pl['name'] if pl else PRICE_LIST_NAME}':")
@@ -352,13 +521,15 @@ def main():
         print(f"\n✅ Sin productos con precio $0 en Distribuidora.")
 
     if stock_cero:
-        print(f"\n🔴 {len(stock_cero)} producto(s) quedaron en STOCK 0 (sin stock en ninguna bodega física):")
+        print(f"\n🔴 {len(stock_cero)} producto(s) APAGADOS HOY (pasaron a stock 0 en esta ejecución):")
         for p in stock_cero[:50]:
             print(f"   • {p['variante']}")
         if len(stock_cero) > 50:
             print(f"   ... y {len(stock_cero)-50} más (ver log)")
     else:
-        print(f"\n✅ Ningún producto quedó en stock 0.")
+        print(f"\n✅ Ningún producto se apagó hoy.")
+    if ya_en_cero:
+        print(f"   ℹ️  Además {ya_en_cero} producto(s) siguen en stock 0 de días anteriores (no listados).")
 
     if errores:
         print(f"\n❌ Primeros errores:")
@@ -374,6 +545,8 @@ def main():
         "elapsed_min": round(elapsed/60, 1), "distribuidora": dist["name"],
         "total_variantes": len(target_ids), "entradas": entradas, "salidas": salidas,
         "sin_cambio": sin_cambio, "errores_count": errores_count,
+        "costos_aplicados": costos_aplicados, "sin_costo": sin_costo,
+        "precio_corregido": precio_corregido, "ya_en_cero": ya_en_cero,
         "cambios": cambios[:300], "precio_cero": precio_cero, "errores": errores
     }
     with open(os.path.join(out_dir, fname), "w", encoding="utf-8") as f:
@@ -387,6 +560,34 @@ def main():
     fecha_str = datetime.now().strftime("%d/%m/%Y %H:%M")
     icono     = "⚠️" if errores_count > 0 else "✅"
 
+    # Construir sección de precios corregidos
+    if precio_corregido:
+        corr_rows_html = "".join(
+            f"<tr><td style='padding:6px 12px;border-bottom:1px solid #f0f0f0'>{p['nombre']}</td>"
+            f"<td style='padding:6px 12px;border-bottom:1px solid #f0f0f0;text-align:right'>${p['precio']:,.0f}</td></tr>"
+            for p in precio_corregido[:50]
+        )
+        if len(precio_corregido) > 50:
+            corr_rows_html += f"<tr><td colspan=2 style='padding:6px 12px;color:#888'>... y {len(precio_corregido)-50} más (ver log)</td></tr>"
+        corr_section_html = f"""
+        <div style="margin-top:24px">
+          <h3 style="color:#38a169;margin-bottom:8px">💰 {len(precio_corregido)} precio(s) {'a corregir (dry run)' if DRY_RUN else 'corregido(s)'}</h3>
+          <p style="color:#666;font-size:13px">Casa Matriz '{CM_PRICE_LIST_NAME}' -{PRICE_DISCOUNT_PCT:.0f}% (valor neto).</p>
+          <table style="width:100%;border-collapse:collapse;font-size:13px">
+            <thead><tr style="background:#f0fff4">
+              <th style="padding:8px 12px;text-align:left;color:#38a169">Producto / Variante</th>
+              <th style="padding:8px 12px;text-align:right;color:#38a169">Precio neto</th>
+            </tr></thead>
+            <tbody>{corr_rows_html}</tbody>
+          </table>
+        </div>"""
+        corr_section_text = f"\n💰 {len(precio_corregido)} PRECIOS CORREGIDOS:\n" + "\n".join(
+            f"  • {p['nombre']} → ${p['precio']:,.0f}" for p in precio_corregido[:50]
+        )
+    else:
+        corr_section_html = ""
+        corr_section_text = ""
+
     # Construir sección de precio $0
     if precio_cero:
         cero_rows_html = "".join(
@@ -398,8 +599,8 @@ def main():
             cero_rows_html += f"<tr><td colspan=2 style='padding:6px 12px;color:#888'>... y {len(precio_cero)-50} más (ver log)</td></tr>"
         cero_section_html = f"""
         <div style="margin-top:24px">
-          <h3 style="color:#e53e3e;margin-bottom:8px">⚠️ {len(precio_cero)} producto(s) con PRECIO $0 en {pl['name'] if pl else price_list_name}</h3>
-          <p style="color:#666;font-size:13px">Estos productos tienen stock en Distribuidora pero precio $0. Pueden venderse sin precio.</p>
+          <h3 style="color:#e53e3e;margin-bottom:8px">⚠️ {len(precio_cero)} producto(s) con PRECIO $0 en {pl['name'] if pl else PRICE_LIST_NAME}</h3>
+          <p style="color:#666;font-size:13px">Estos productos tienen stock en Distribuidora pero precio $0 y no se pudieron corregir (sin precio en la lista base). Pueden venderse sin precio.</p>
           <table style="width:100%;border-collapse:collapse;font-size:13px">
             <thead><tr style="background:#fff5f5">
               <th style="padding:8px 12px;text-align:left;color:#e53e3e">Producto / Variante</th>
@@ -425,8 +626,9 @@ def main():
             cero0_rows_html += f"<tr><td style='padding:5px 12px;color:#888;font-size:12px'>... y {len(stock_cero)-100} más</td></tr>"
         stock_cero_section_html = f"""
         <div style="margin-top:24px">
-          <h3 style="color:#c05621;margin-bottom:8px">🔴 {len(stock_cero)} producto(s) quedaron en STOCK 0</h3>
-          <p style="color:#666;font-size:13px">Estos productos no tienen stock en ninguna bodega física y fueron apagados en la Distribuidora.</p>
+          <h3 style="color:#c05621;margin-bottom:8px">🔴 {len(stock_cero)} producto(s) apagados HOY</h3>
+          <p style="color:#666;font-size:13px">Pasaron a stock 0 en la Distribuidora en esta ejecución (se agotaron en todas las bodegas físicas).
+          Además {ya_en_cero} producto(s) siguen en stock 0 de días anteriores (no listados).</p>
           <table style="width:100%;border-collapse:collapse;font-size:13px">
             <thead><tr style="background:#fff5f0">
               <th style="padding:8px 12px;text-align:left;color:#c05621">Producto / Variante</th>
@@ -434,12 +636,12 @@ def main():
             <tbody>{cero0_rows_html}</tbody>
           </table>
         </div>"""
-        stock_cero_section_text = f"\n🔴 {len(stock_cero)} PRODUCTOS EN STOCK 0:\n" + "\n".join(
+        stock_cero_section_text = f"\n🔴 {len(stock_cero)} PRODUCTOS APAGADOS HOY (+{ya_en_cero} ya estaban en 0):\n" + "\n".join(
             f"  • {p['variante']}" for p in stock_cero[:100]
         )
     else:
-        stock_cero_section_html = "<p style='color:#38a169;margin-top:16px'>✅ Ningún producto quedó en stock 0.</p>"
-        stock_cero_section_text = "\n✅ Ningún producto quedó en stock 0."
+        stock_cero_section_html = f"<p style='color:#38a169;margin-top:16px'>✅ Ningún producto se apagó hoy ({ya_en_cero} siguen en stock 0 de días anteriores).</p>"
+        stock_cero_section_text = f"\n✅ Ningún producto se apagó hoy ({ya_en_cero} siguen en stock 0 de días anteriores)."
 
     body_html = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"></head>
@@ -467,6 +669,14 @@ def main():
           <td style="padding:10px 14px;color:#718096">➡️ Sin cambio</td>
           <td style="padding:10px 14px;text-align:right;color:#718096">{sin_cambio}</td>
         </tr>
+        <tr style="background:#f0fff4">
+          <td style="padding:10px 14px;color:#38a169">💲 Costos aplicados en entradas</td>
+          <td style="padding:10px 14px;text-align:right;color:#38a169;font-weight:bold">{costos_aplicados}</td>
+        </tr>
+        <tr>
+          <td style="padding:10px 14px;color:#38a169">💰 Precios corregidos</td>
+          <td style="padding:10px 14px;text-align:right;color:#38a169;font-weight:bold">{len(precio_corregido)}</td>
+        </tr>
         <tr style="background:#fff5f5">
           <td style="padding:10px 14px;color:#e53e3e">❌ Errores</td>
           <td style="padding:10px 14px;text-align:right;color:#e53e3e;font-weight:bold">{errores_count}</td>
@@ -476,6 +686,7 @@ def main():
           <td style="padding:10px 14px;text-align:right;color:#718096">{elapsed/60:.1f} min</td>
         </tr>
       </table>
+      {corr_section_html}
       {cero_section_html}
       {stock_cero_section_html}
     </div>
@@ -492,12 +703,16 @@ Variantes procesadas : {len(target_ids)}
 Entradas (subió)     : {entradas}
 Salidas  (bajó)      : {salidas}
 Sin cambio           : {sin_cambio}
+Costos aplicados     : {costos_aplicados}
+Precios corregidos   : {len(precio_corregido)}
 Errores              : {errores_count}
 Tiempo total         : {elapsed/60:.1f} min
+{corr_section_text}
 {cero_section_text}
 {stock_cero_section_text}
 """
-    subject = f"{icono} Stock Bsale {fecha_str} — {entradas}↑ {salidas}↓ {len(stock_cero)}🔴cero"
+    subject = (f"{icono} Stock Bsale {fecha_str} — {entradas}↑ {salidas}↓ "
+               f"{len(precio_corregido)}💰 {len(stock_cero)}🔴hoy")
     send_summary_email(subject, body_html, body_text)
 
 
