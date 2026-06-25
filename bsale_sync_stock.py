@@ -691,7 +691,7 @@ def main():
       {stock_cero_section_html}
     </div>
     <div style="background:#f7fafc;padding:14px 32px;font-size:12px;color:#a0aec0;text-align:center">
-      Agente Sincronizador de Stock Bsale · CREAO · Ejecución automática 21:00 hrs
+      Agente Sincronizador de Stock Bsale · CREADOR JONATHAN · Ejecución automática 21:00 hrs
     </div>
   </div>
 </body></html>"""
