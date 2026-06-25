@@ -33,6 +33,7 @@ jobs:
           price_list_name: ${{ secrets.PRICE_LIST_NAME }}
           cm_price_list_name: ${{ secrets.CM_PRICE_LIST_NAME }}
           price_discount_pct: ${{ secrets.PRICE_DISCOUNT_PCT }}
+          oficinas_excluidas: ${{ secrets.OFICINAS_EXCLUIDAS }}
           sync_costs: ${{ secrets.SYNC_COSTS }}
           sync_prices: ${{ secrets.SYNC_PRICES }}
           sync_all: ${{ secrets.SYNC_ALL }}
@@ -40,5 +41,6 @@ jobs:
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
         run: |
           python bsale_sync_stock.py
