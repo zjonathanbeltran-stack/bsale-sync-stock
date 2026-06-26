@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """
-Sincronizador Stock Bsale v7
+Sincronizador Stock Bsale v8
 - Descarga paralela por bodega (aiohttp)
 - Reintentos automáticos en 401/429/503 con backoff exponencial
 - Pausas inteligentes entre bloques de POST para evitar rate limit
 - Nombres completos de productos (expand=product)
 - v6: recepciones con costo real (campo `cost`)
-- v7: precios $0 corregidos desde CASA MATRIZ (token separado),
-  cruce por código de barras, descuento configurable (default 5%)
+- v7: precios $0 corregidos desde CASA MATRIZ (token separado)
+- v8: precios de packs calculados desde su contenido (pack_details)
 """
-import os, json, asyncio, aiohttp, time, math
+import os, json, asyncio, aiohttp, time, math, sys
+if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
 from datetime import datetime
 from collections import defaultdict
 import requests
@@ -39,6 +44,7 @@ SYNC_PACKS            = os.environ.get("sync_packs", "true").lower() == "true"
 PACKS_ONLY            = os.environ.get("packs_only", "false").lower() == "true"
 PACK_DISCOUNT_PCT     = float(os.environ.get("pack_discount_pct", "0"))  # 0 = exacto (unitario × cantidad)
 PACK_FACTOR           = 1 - PACK_DISCOUNT_PCT / 100.0
+PACK_UPDATE_ALL       = os.environ.get("pack_update_all", "false").lower() == "true"  # true = actualizar TODOS los packs, false = solo $0
 
 # Parámetros de rate limiting
 POST_BATCH_SIZE       = 30     # Aplicar pausa cada N POSTs
@@ -212,18 +218,12 @@ def fetch_all_pages(endpoint, params=None, label=""):
 # ── v8: Precios de packs (cajas/displays) ─────────────────────
 def _extract_pack_detail(prod, headers):
     """Normaliza la composición de un pack a [(variantId, quantity, multipleVariant)].
-    Bsale devuelve la composición como `packDetail`/`pack_detail`, ya sea un array
-    embebido o un sub-recurso {href:...} que hay que seguir."""
-    raw = prod.get("packDetail") or prod.get("pack_detail")
-    if isinstance(raw, dict):
-        href = raw.get("href")
-        if href:
-            endpoint = href.split("/v1", 1)[-1] if "/v1" in href else href
-            raw = api_get(endpoint, headers=headers)
+    Bsale devuelve: "pack_details": [{"quantity": 12, "variant": {"id": 2419}, "multipleVariant": 0}]"""
     items = []
-    if isinstance(raw, dict):
-        raw = raw.get("items", [])
-    for it in (raw or []):
+    pd = prod.get("pack_details", [])
+    if not pd:
+        return items
+    for it in pd:
         if not isinstance(it, dict):
             continue
         vid = it.get("variantId")
@@ -257,7 +257,7 @@ def sync_pack_prices(headers, price_list_name, label, variants_info, dry_run, de
     details = fetch_all_pages(f"/price_lists/{pl['id']}/details.json",
                               {"expand": "[variant]"}, label=f"Precios {label}")
 
-    # Mapa variante -> precio (los unitarios que sirven de base) y candidatos a pack ($0)
+    # Mapa variante -> precio (los unitarios que sirven de base) y candidatos a pack
     unit_price, candidatos = {}, []
     for d in details:
         v = d.get("variant")
@@ -269,8 +269,9 @@ def sync_pack_prices(headers, price_list_name, label, variants_info, dry_run, de
         val = float(d.get("variantValue", 0) or 0)
         if val > 0:
             unit_price[vid] = val
-        else:
-            candidatos.append({"vid": vid, "detail_id": d.get("id"),
+        # Candidato: variantes en $0 (potencialmente packs)
+        if val == 0:
+            candidatos.append({"vid": vid, "detail_id": d.get("id"), "precio_actual": val,
                                "nombre": variants_info.get(vid) or v.get("description") or f"ID {vid}"})
 
     print(f"  → {len(candidatos)} variante(s) en $0 a revisar (de {len(details)} en la lista)", flush=True)
@@ -288,7 +289,7 @@ def sync_pack_prices(headers, price_list_name, label, variants_info, dry_run, de
             if classification != 3 or not pid:
                 continue  # no es pack → lo maneja la corrección de precios $0 (v7)
 
-            pdata = api_get(f"/products/{pid}.json", {"expand": "[pack_detail]"}, headers=headers)
+            pdata = api_get(f"/products/{pid}.json", headers=headers)
             comps = _extract_pack_detail(pdata, headers)
             nombre = item["nombre"] or pdata.get("name") or f"ID {vid}"
             if debug:
@@ -317,6 +318,13 @@ def sync_pack_prices(headers, price_list_name, label, variants_info, dry_run, de
                 pendientes.append({**item, "nombre": nombre, "motivo": "sin detail_id"})
                 continue
 
+            precio_actual = item.get("precio_actual", 0)
+            if PACK_UPDATE_ALL and precio_actual == target:
+                # Ya tiene el precio correcto, nada que hacer
+                corregidos.append({"nombre": nombre, "precio": target, "n_items": len(comps),
+                                   "lista": pl["name"], "estado": "ya_correcto"})
+                continue
+
             if not dry_run:
                 api_put(f"/price_lists/{pl['id']}/details/{item['detail_id']}.json",
                         {"id": item["detail_id"], "variantValue": target}, headers=headers)
@@ -324,8 +332,8 @@ def sync_pack_prices(headers, price_list_name, label, variants_info, dry_run, de
                 if put_count % POST_BATCH_SIZE == 0:
                     print(f"  ⏸  Pausa {POST_BATCH_SLEEP}s tras {put_count} packs...", flush=True)
                     time.sleep(POST_BATCH_SLEEP)
-            corregidos.append({"nombre": nombre, "precio": target,
-                               "n_items": len(comps), "lista": pl["name"]})
+            corregidos.append({"nombre": nombre, "precio": target, "n_items": len(comps),
+                               "lista": pl["name"], "precio_anterior": precio_actual if PACK_UPDATE_ALL else None})
             time.sleep(GET_PAGE_SLEEP)
         except Exception as e:
             pendientes.append({**item, "motivo": f"error: {e}"})
