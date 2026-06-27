@@ -280,7 +280,9 @@ def sync_pack_prices(headers, price_list_name, label, variants_info, dry_run, de
         vid = item["vid"]
         try:
             vdata = api_get(f"/variants/{vid}.json", {"expand": "[product]"}, headers=headers)
-            prod  = vdata.get("product") if isinstance(vdata.get("product"), dict) else {}
+            # BSale puede devolver: {"variant": {..., "product": {...}}} o {"variant": {...}}
+            variant_data = vdata.get("variant", {}) if isinstance(vdata.get("variant"), dict) else {}
+            prod = variant_data.get("product") if isinstance(variant_data.get("product"), dict) else {}
             classification = prod.get("classification")
             pid = prod.get("id")
             if debug:
