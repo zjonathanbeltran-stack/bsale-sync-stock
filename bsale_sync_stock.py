@@ -1,20 +1,15 @@
 #!/usr/bin/env python3
 """
-Sincronizador Stock Bsale v8
+Sincronizador Stock Bsale v7
 - Descarga paralela por bodega (aiohttp)
 - Reintentos automáticos en 401/429/503 con backoff exponencial
 - Pausas inteligentes entre bloques de POST para evitar rate limit
 - Nombres completos de productos (expand=product)
 - v6: recepciones con costo real (campo `cost`)
-- v7: precios $0 corregidos desde CASA MATRIZ (token separado)
-- v8: precios de packs calculados desde su contenido (pack_details)
+- v7: precios $0 corregidos desde CASA MATRIZ (token separado),
+  cruce por código de barras, descuento configurable (default 5%)
 """
-import os, json, asyncio, aiohttp, time, math, sys
-if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
-    try:
-        sys.stdout.reconfigure(encoding='utf-8')
-    except Exception:
-        pass
+import os, json, asyncio, aiohttp, time, math
 from datetime import datetime
 from collections import defaultdict
 import requests
@@ -39,12 +34,6 @@ EXCLUDED_OFFICES      = [e.strip() for e in EXCLUDED_OFFICES_RAW.split(",") if e
 # v6/v7: sincronización de valores
 SYNC_COSTS            = os.environ.get("sync_costs", "true").lower() == "true"
 SYNC_PRICES           = os.environ.get("sync_prices", "true").lower() == "true"
-# v8: precios de packs (cajas/displays) calculados desde su contenido
-SYNC_PACKS            = os.environ.get("sync_packs", "true").lower() == "true"
-PACKS_ONLY            = os.environ.get("packs_only", "false").lower() == "true"
-PACK_DISCOUNT_PCT     = float(os.environ.get("pack_discount_pct", "0"))  # 0 = exacto (unitario × cantidad)
-PACK_FACTOR           = 1 - PACK_DISCOUNT_PCT / 100.0
-PACK_UPDATE_ALL       = os.environ.get("pack_update_all", "false").lower() == "true"  # true = actualizar TODOS los packs, false = solo $0
 
 # Parámetros de rate limiting
 POST_BATCH_SIZE       = 30     # Aplicar pausa cada N POSTs
@@ -53,12 +42,11 @@ GET_PAGE_SLEEP        = 0.25   # Pausa entre páginas en GETs secuenciales
 MAX_RETRIES           = 5      # Reintentos máximos por llamada
 
 # ── Helpers sync con backoff exponencial ──────────────────────
-def api_get(endpoint, params=None, headers=None):
-    headers = headers or HEADERS
+def api_get(endpoint, params=None):
     params = {**(params or {})}
     for attempt in range(MAX_RETRIES):
         try:
-            r = requests.get(f"{BASE_URL}{endpoint}", headers=headers,
+            r = requests.get(f"{BASE_URL}{endpoint}", headers=HEADERS,
                              params=params, timeout=45)
             if r.status_code == 429:
                 wait = min(60, 5 * 2**attempt)
@@ -159,11 +147,10 @@ def load_cm_prices():
     print(f"  ✅ {len(cm_prices)} precios cargados desde Casa Matriz")
     return cm_prices
 
-def api_put(endpoint, payload, headers=None):
-    headers = headers or HEADERS
+def api_put(endpoint, payload):
     for attempt in range(MAX_RETRIES):
         try:
-            r = requests.put(f"{BASE_URL}{endpoint}", headers=headers,
+            r = requests.put(f"{BASE_URL}{endpoint}", headers=HEADERS,
                              json=payload, timeout=30)
             if r.status_code == 429:
                 wait = min(60, 10 * 2**attempt)
@@ -214,133 +201,6 @@ def fetch_all_pages(endpoint, params=None, label=""):
             break
         time.sleep(GET_PAGE_SLEEP)
     return items
-
-# ── v8: Precios de packs (cajas/displays) ─────────────────────
-def _extract_pack_detail(prod, headers):
-    """Normaliza la composición de un pack a [(variantId, quantity, multipleVariant)].
-    Bsale devuelve: "pack_details": [{"quantity": 12, "variant": {"id": 2419}, "multipleVariant": 0}]"""
-    items = []
-    pd = prod.get("pack_details", [])
-    if not pd:
-        return items
-    for it in pd:
-        if not isinstance(it, dict):
-            continue
-        vid = it.get("variantId")
-        if not vid:
-            v = it.get("variant")
-            vid = v.get("id") if isinstance(v, dict) else None
-        try:
-            vid = int(vid) if vid else 0
-        except (TypeError, ValueError):
-            vid = 0
-        qty  = float(it.get("quantity", 0) or 0)
-        mult = int(it.get("multipleVariant", 0) or 0)
-        if vid and qty > 0:
-            items.append((vid, qty, mult))
-    return items
-
-
-def sync_pack_prices(headers, price_list_name, label, variants_info, dry_run, debug=False):
-    """Calcula y asigna el precio de los packs en $0 de una lista, sumando el precio
-    de cada variante que los compone (precio_pack = Σ unitario × cantidad × PACK_FACTOR).
-    Solo toca packs con variantValue == 0 (nunca pisa precios existentes)."""
-    print(f"\n📦 [{label}] Calculando precios de packs en $0...", flush=True)
-    corregidos, pendientes = [], []
-
-    pls = api_get("/price_lists.json", {"limit": 50}, headers=headers).get("items", [])
-    pl  = next((p for p in pls if price_list_name in p.get("name", "").lower()), None)
-    if not pl:
-        print(f"  ⚠ Lista '{price_list_name}' no encontrada en {label}.")
-        return {"corregidos": corregidos, "pendientes": pendientes, "lista": price_list_name}
-
-    details = fetch_all_pages(f"/price_lists/{pl['id']}/details.json",
-                              {"expand": "[variant]"}, label=f"Precios {label}")
-
-    # Mapa variante -> precio (los unitarios que sirven de base) y candidatos a pack
-    unit_price, candidatos = {}, []
-    for d in details:
-        v = d.get("variant")
-        if not isinstance(v, dict):
-            continue
-        vid = int(v.get("id", 0) or 0)
-        if not vid:
-            continue
-        val = float(d.get("variantValue", 0) or 0)
-        if val > 0:
-            unit_price[vid] = val
-        # Candidato: variantes en $0 (potencialmente packs)
-        if val == 0:
-            candidatos.append({"vid": vid, "detail_id": d.get("id"), "precio_actual": val,
-                               "nombre": variants_info.get(vid) or v.get("description") or f"ID {vid}"})
-
-    print(f"  → {len(candidatos)} variante(s) en $0 a revisar (de {len(details)} en la lista)", flush=True)
-    put_count = 0
-    for item in candidatos:
-        vid = item["vid"]
-        try:
-            vdata = api_get(f"/variants/{vid}.json", {"expand": "[product]"}, headers=headers)
-            prod  = vdata.get("product") if isinstance(vdata.get("product"), dict) else {}
-            classification = prod.get("classification")
-            pid = prod.get("id")
-            if debug:
-                print(f"    [debug] vid={vid} classification={classification} pid={pid} "
-                      f"keys_prod={list(prod.keys())[:8]}", flush=True)
-            if classification != 3 or not pid:
-                continue  # no es pack → lo maneja la corrección de precios $0 (v7)
-
-            pdata = api_get(f"/products/{pid}.json", headers=headers)
-            comps = _extract_pack_detail(pdata, headers)
-            nombre = item["nombre"] or pdata.get("name") or f"ID {vid}"
-            if debug:
-                print(f"    [debug] pack '{nombre}' comps={comps}", flush=True)
-
-            if not comps:
-                pendientes.append({**item, "nombre": nombre, "motivo": "sin composición legible"})
-                continue
-            if any(m == 1 for _, _, m in comps):
-                pendientes.append({**item, "nombre": nombre, "motivo": "pack abierto (variante variable)"})
-                continue
-
-            total, faltante = 0.0, False
-            for cvid, qty, _ in comps:
-                p = unit_price.get(cvid, 0)
-                if p <= 0:
-                    faltante = True
-                    break
-                total += p * qty
-            if faltante or total <= 0:
-                pendientes.append({**item, "nombre": nombre, "motivo": "componente sin precio en la lista"})
-                continue
-
-            target = round(total * PACK_FACTOR)
-            if not item.get("detail_id"):
-                pendientes.append({**item, "nombre": nombre, "motivo": "sin detail_id"})
-                continue
-
-            precio_actual = item.get("precio_actual", 0)
-            if PACK_UPDATE_ALL and precio_actual == target:
-                # Ya tiene el precio correcto, nada que hacer
-                corregidos.append({"nombre": nombre, "precio": target, "n_items": len(comps),
-                                   "lista": pl["name"], "estado": "ya_correcto"})
-                continue
-
-            if not dry_run:
-                api_put(f"/price_lists/{pl['id']}/details/{item['detail_id']}.json",
-                        {"id": item["detail_id"], "variantValue": target}, headers=headers)
-                put_count += 1
-                if put_count % POST_BATCH_SIZE == 0:
-                    print(f"  ⏸  Pausa {POST_BATCH_SLEEP}s tras {put_count} packs...", flush=True)
-                    time.sleep(POST_BATCH_SLEEP)
-            corregidos.append({"nombre": nombre, "precio": target, "n_items": len(comps),
-                               "lista": pl["name"], "precio_anterior": precio_actual if PACK_UPDATE_ALL else None})
-            time.sleep(GET_PAGE_SLEEP)
-        except Exception as e:
-            pendientes.append({**item, "motivo": f"error: {e}"})
-
-    print(f"  ✅ [{label}] {len(corregidos)} pack(s) "
-          f"{'simulado(s)' if dry_run else 'corregido(s)'}, {len(pendientes)} pendiente(s)")
-    return {"corregidos": corregidos, "pendientes": pendientes, "lista": pl["name"]}
 
 # ── Descarga async paralela por bodega ────────────────────────
 async def fetch_office_async(session, office_id, office_name, semaphore):
@@ -419,123 +279,10 @@ def send_summary_email(subject, body_html, body_text):
         print(f"  ❌ Error enviando email: {e}")
         return False
 
-# ── v8: Resumen de packs (HTML + texto) reutilizable ──────────
-def build_pack_email_sections(pack_corregidos, pack_pendientes, dry_run):
-    if pack_corregidos:
-        rows = "".join(
-            f"<tr><td style='padding:6px 12px;border-bottom:1px solid #f0f0f0'>{p['nombre']}</td>"
-            f"<td style='padding:6px 12px;border-bottom:1px solid #f0f0f0;text-align:right'>${p['precio']:,.0f}</td></tr>"
-            for p in pack_corregidos[:50]
-        )
-        if len(pack_corregidos) > 50:
-            rows += f"<tr><td colspan=2 style='padding:6px 12px;color:#888'>... y {len(pack_corregidos)-50} más (ver log)</td></tr>"
-        html = f"""
-        <div style="margin-top:24px">
-          <h3 style="color:#2b6cb0;margin-bottom:8px">📦 {len(pack_corregidos)} pack(s) {'a corregir (dry run)' if dry_run else 'corregido(s)'}</h3>
-          <p style="color:#666;font-size:13px">Precio calculado como suma del contenido (unitario × cantidad{f' −{PACK_DISCOUNT_PCT:.0f}%' if PACK_DISCOUNT_PCT else ''}).</p>
-          <table style="width:100%;border-collapse:collapse;font-size:13px">
-            <thead><tr style="background:#ebf8ff">
-              <th style="padding:8px 12px;text-align:left;color:#2b6cb0">Pack</th>
-              <th style="padding:8px 12px;text-align:right;color:#2b6cb0">Precio</th>
-            </tr></thead><tbody>{rows}</tbody>
-          </table>
-        </div>"""
-        text = f"\n📦 {len(pack_corregidos)} PACKS CORREGIDOS:\n" + "\n".join(
-            f"  • {p['nombre']} → ${p['precio']:,.0f}" for p in pack_corregidos[:50])
-    else:
-        html = "<p style='color:#718096;margin-top:16px'>📦 Sin packs en $0 que corregir.</p>"
-        text = "\n📦 Sin packs en $0 que corregir."
-
-    if pack_pendientes:
-        prows = "".join(
-            f"<tr><td style='padding:6px 12px;border-bottom:1px solid #f0f0f0'>{p['nombre']}</td>"
-            f"<td style='padding:6px 12px;border-bottom:1px solid #f0f0f0;color:#c05621'>{p.get('motivo','')}</td></tr>"
-            for p in pack_pendientes[:50]
-        )
-        if len(pack_pendientes) > 50:
-            prows += f"<tr><td colspan=2 style='padding:6px 12px;color:#888'>... y {len(pack_pendientes)-50} más</td></tr>"
-        html += f"""
-        <div style="margin-top:16px">
-          <h3 style="color:#c05621;margin-bottom:8px">⚠️ {len(pack_pendientes)} pack(s) pendiente(s) de revisión manual</h3>
-          <table style="width:100%;border-collapse:collapse;font-size:13px">
-            <thead><tr style="background:#fffaf0">
-              <th style="padding:8px 12px;text-align:left;color:#c05621">Pack</th>
-              <th style="padding:8px 12px;text-align:left;color:#c05621">Motivo</th>
-            </tr></thead><tbody>{prows}</tbody>
-          </table>
-        </div>"""
-        text += f"\n⚠️ {len(pack_pendientes)} PACKS PENDIENTES:\n" + "\n".join(
-            f"  • {p['nombre']} ({p.get('motivo','')})" for p in pack_pendientes[:50])
-    return html, text
-
-
-def run_packs_only():
-    """Modo standalone: solo calcula y corrige precios de packs en $0, en ambas
-    empresas. No descarga stock ni toca precios unitarios."""
-    t0 = time.time()
-    print(f"🚀 Inicio (SOLO PACKS): {datetime.now().strftime('%d/%m/%Y %H:%M')}")
-    print(f"{'🔍 DRY RUN (sin cambios)' if DRY_RUN else '⚡ MODO REAL'}")
-    print("="*60)
-
-    pack_corregidos, pack_pendientes = [], []
-    targets = [(HEADERS, PRICE_LIST_NAME, "Distribuidora")]
-    if CM_TOKEN:
-        targets.append((HEADERS_CM, CM_PRICE_LIST_NAME, "Casa Matriz"))
-    else:
-        print("  ⚠ BSALE_CM_TOKEN no configurado — solo se revisan packs de la Distribuidora.")
-    for hdrs, lname, lbl in targets:
-        res = sync_pack_prices(hdrs, lname, lbl, {}, DRY_RUN, debug=DRY_RUN)
-        pack_corregidos += res["corregidos"]
-        pack_pendientes += res["pendientes"]
-
-    elapsed = time.time() - t0
-    print("\n" + "="*60)
-    print(f"{'🔍 SIMULACIÓN' if DRY_RUN else '✅ PACKS'} — {elapsed/60:.1f} min")
-    print(f"   📦 Packs corregidos : {len(pack_corregidos)}")
-    print(f"   ⚠️  Pendientes       : {len(pack_pendientes)}")
-    for p in pack_corregidos[:30]:
-        print(f"   • {p['nombre']} → ${p['precio']:,.0f}")
-    for p in pack_pendientes[:30]:
-        print(f"   ⚠ {p['nombre']} ({p.get('motivo','')})")
-
-    # Log JSON
-    out_dir = os.path.join(os.getcwd(), "files")
-    os.makedirs(out_dir, exist_ok=True)
-    fname = f"packs_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-    with open(os.path.join(out_dir, fname), "w", encoding="utf-8") as f:
-        json.dump({"fecha": datetime.now().isoformat(), "dry_run": DRY_RUN,
-                   "pack_corregidos": pack_corregidos, "pack_pendientes": pack_pendientes},
-                  f, ensure_ascii=False, indent=2)
-    print(f"\n📁 Log guardado: {fname}")
-
-    # Email
-    fecha_str = datetime.now().strftime("%d/%m/%Y %H:%M")
-    modo_str  = "🔍 SIMULACIÓN (Dry Run)" if DRY_RUN else "⚡ Ejecución Real"
-    pack_html, pack_text = build_pack_email_sections(pack_corregidos, pack_pendientes, DRY_RUN)
-    body_html = f"""<!DOCTYPE html><html><head><meta charset="utf-8"></head>
-<body style="font-family:Arial,sans-serif;background:#f7f7f7;padding:20px">
-  <div style="max-width:640px;margin:0 auto;background:#fff;border-radius:10px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.08)">
-    <div style="background:#2b6cb0;padding:24px 32px">
-      <h1 style="color:#fff;margin:0;font-size:20px">📦 Precios de Packs Bsale</h1>
-      <p style="color:#bee3f8;margin:4px 0 0;font-size:13px">{fecha_str} · {modo_str}</p>
-    </div>
-    <div style="padding:28px 32px">{pack_html}</div>
-    <div style="background:#f7fafc;padding:14px 32px;font-size:12px;color:#a0aec0;text-align:center">
-      Agente Bsale · Modo solo packs · CREADOR JONATHAN
-    </div>
-  </div></body></html>"""
-    body_text = f"PRECIOS DE PACKS BSALE — {fecha_str}\n{modo_str}\n{'='*50}{pack_text}\n"
-    icono = "📦" if pack_corregidos else "✅"
-    send_summary_email(f"{icono} Packs Bsale {fecha_str} — {len(pack_corregidos)} corregidos, "
-                       f"{len(pack_pendientes)} pendientes", body_html, body_text)
-
-
 # ── Main ──────────────────────────────────────────────────────
 def main():
     if not API_TOKEN:
         print("❌ No se encontró BSALE_API_TOKEN. Guárdalo en Settings → Secrets."); return
-    if PACKS_ONLY:
-        run_packs_only(); return
     if not SYNC_ALL and not PRODUCTS:
         print("❌ Activa 'Sincronizar Todo' o escribe productos en la lista."); return
 
@@ -738,17 +485,6 @@ def main():
     else:
         print(f"  ⚠ Lista '{PRICE_LIST_NAME}' no encontrada.")
 
-    # ── 5b. Precios de packs (v8): calculados desde su contenido ──
-    pack_corregidos, pack_pendientes = [], []
-    if SYNC_PACKS:
-        pack_targets = [(HEADERS, PRICE_LIST_NAME, "Distribuidora")]
-        if CM_TOKEN:
-            pack_targets.append((HEADERS_CM, CM_PRICE_LIST_NAME, "Casa Matriz"))
-        for hdrs, lname, lbl in pack_targets:
-            res = sync_pack_prices(hdrs, lname, lbl, variants_info, DRY_RUN)
-            pack_corregidos += res["corregidos"]
-            pack_pendientes += res["pendientes"]
-
     # ── 6. Resumen ───────────────────────────────────────────
     elapsed = time.time() - t0
     print("\n" + "="*60)
@@ -759,7 +495,6 @@ def main():
     print(f"   ➡️  Sin cambio           : {sin_cambio}")
     print(f"   💲 Costos aplicados     : {costos_aplicados}")
     print(f"   💰 Precios corregidos   : {len(precio_corregido)}")
-    print(f"   📦 Packs corregidos     : {len(pack_corregidos)} ({len(pack_pendientes)} pendientes)")
     print(f"   ❌ Errores              : {errores_count}")
 
     if sin_costo:
@@ -812,7 +547,6 @@ def main():
         "sin_cambio": sin_cambio, "errores_count": errores_count,
         "costos_aplicados": costos_aplicados, "sin_costo": sin_costo,
         "precio_corregido": precio_corregido, "ya_en_cero": ya_en_cero,
-        "pack_corregidos": pack_corregidos, "pack_pendientes": pack_pendientes,
         "cambios": cambios[:300], "precio_cero": precio_cero, "errores": errores
     }
     with open(os.path.join(out_dir, fname), "w", encoding="utf-8") as f:
@@ -909,10 +643,6 @@ def main():
         stock_cero_section_html = f"<p style='color:#38a169;margin-top:16px'>✅ Ningún producto se apagó hoy ({ya_en_cero} siguen en stock 0 de días anteriores).</p>"
         stock_cero_section_text = f"\n✅ Ningún producto se apagó hoy ({ya_en_cero} siguen en stock 0 de días anteriores)."
 
-    # Sección de packs (v8)
-    pack_section_html, pack_section_text = build_pack_email_sections(
-        pack_corregidos, pack_pendientes, DRY_RUN)
-
     body_html = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"></head>
 <body style="font-family:Arial,sans-serif;background:#f7f7f7;padding:20px">
@@ -947,10 +677,6 @@ def main():
           <td style="padding:10px 14px;color:#38a169">💰 Precios corregidos</td>
           <td style="padding:10px 14px;text-align:right;color:#38a169;font-weight:bold">{len(precio_corregido)}</td>
         </tr>
-        <tr style="background:#ebf8ff">
-          <td style="padding:10px 14px;color:#2b6cb0">📦 Packs corregidos</td>
-          <td style="padding:10px 14px;text-align:right;color:#2b6cb0;font-weight:bold">{len(pack_corregidos)}</td>
-        </tr>
         <tr style="background:#fff5f5">
           <td style="padding:10px 14px;color:#e53e3e">❌ Errores</td>
           <td style="padding:10px 14px;text-align:right;color:#e53e3e;font-weight:bold">{errores_count}</td>
@@ -961,7 +687,6 @@ def main():
         </tr>
       </table>
       {corr_section_html}
-      {pack_section_html}
       {cero_section_html}
       {stock_cero_section_html}
     </div>
@@ -980,16 +705,14 @@ Salidas  (bajó)      : {salidas}
 Sin cambio           : {sin_cambio}
 Costos aplicados     : {costos_aplicados}
 Precios corregidos   : {len(precio_corregido)}
-Packs corregidos     : {len(pack_corregidos)} ({len(pack_pendientes)} pendientes)
 Errores              : {errores_count}
 Tiempo total         : {elapsed/60:.1f} min
 {corr_section_text}
-{pack_section_text}
 {cero_section_text}
 {stock_cero_section_text}
 """
     subject = (f"{icono} Stock Bsale {fecha_str} — {entradas}↑ {salidas}↓ "
-               f"{len(precio_corregido)}💰 {len(pack_corregidos)}📦 {len(stock_cero)}🔴hoy")
+               f"{len(precio_corregido)}💰 {len(stock_cero)}🔴hoy")
     send_summary_email(subject, body_html, body_text)
 
 
